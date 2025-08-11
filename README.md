@@ -165,8 +165,8 @@ Internet
 
 
 **Your Name**  Pawan Gupta
-Email: [your.email@example.com](mailto:your.email@example.com)
-GitHub: [https://github.com/yourusername](https://github.com/yourusername)
+Email: pawan2gupta@gmail.com
+GitHub: https://github.com/Paawan2311/new-app
 
 ---
 
