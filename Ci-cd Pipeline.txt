@@ -1,0 +1,94 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+env:
+  AWS_REGION: us-east-1           # Change as needed
+  ECR_FRONTEND_REPO: your-frontend-ecr-repo-name
+  ECR_BACKEND_REPO: your-backend-ecr-repo-name
+  ANSIBLE_INVENTORY_PATH: ./ansible/inventory
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ env.AWS_REGION }}
+      ECR_FRONTEND_REPO: ${{ env.ECR_FRONTEND_REPO }}
+      ECR_BACKEND_REPO: ${{ env.ECR_BACKEND_REPO }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build and Push Frontend Docker image
+        run: |
+          FRONTEND_IMAGE_TAG="${{ github.sha }}"
+          docker build -t $ECR_FRONTEND_REPO:frontend-$FRONTEND_IMAGE_TAG ./frontend-web
+          docker tag $ECR_FRONTEND_REPO:frontend-$FRONTEND_IMAGE_TAG ${{ steps.login-ecr.outputs.registry }}/${ECR_FRONTEND_REPO}:frontend-$FRONTEND_IMAGE_TAG
+          docker push ${{ steps.login-ecr.outputs.registry }}/${ECR_FRONTEND_REPO}:frontend-$FRONTEND_IMAGE_TAG
+          echo "frontend_image=${{ steps.login-ecr.outputs.registry }}/${ECR_FRONTEND_REPO}:frontend-$FRONTEND_IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Build and Push Backend Docker image
+        run: |
+          BACKEND_IMAGE_TAG="${{ github.sha }}"
+          docker build -t $ECR_BACKEND_REPO:backend-$BACKEND_IMAGE_TAG ./backend-api
+          docker tag $ECR_BACKEND_REPO:backend-$BACKEND_IMAGE_TAG ${{ steps.login-ecr.outputs.registry }}/${ECR_BACKEND_REPO}:backend-$BACKEND_IMAGE_TAG
+          docker push ${{ steps.login-ecr.outputs.registry }}/${ECR_BACKEND_REPO}:backend-$BACKEND_IMAGE_TAG
+          echo "backend_image=${{ steps.login-ecr.outputs.registry }}/${ECR_BACKEND_REPO}:backend-$BACKEND_IMAGE_TAG" >> $GITHUB_ENV
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    env:
+      ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
+      FRONTEND_IMAGE: ${{ env.frontend_image }}
+      BACKEND_IMAGE: ${{ env.backend_image }}
+      ANSIBLE_USER: ec2-user
+      ANSIBLE_PRIVATE_KEY: ${{ secrets.BASTION_SSH_PRIVATE_KEY }}
+      BASTION_HOST: ${{ secrets.BASTION_HOST }}
+      TARGET_HOSTS: ${{ secrets.DEV_TARGET_HOSTS }}  # for dev branch, or PROD_TARGET_HOSTS for prod below
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Ansible
+        run: |
+          sudo apt update
+          sudo apt install -y ansible sshpass
+
+      - name: Prepare Ansible Inventory
+        run: |
+          mkdir -p ansible
+          echo "[bastion]" > ansible/inventory
+          echo "${BASTION_HOST} ansible_user=${ANSIBLE_USER}" >> ansible/inventory
+          echo "[targets]" >> ansible/inventory
+          if [[ "${ENVIRONMENT}" == "prod" ]]; then
+            echo "${{ secrets.PROD_TARGET_HOSTS }}" >> ansible/inventory
+          else
+            echo "${{ secrets.DEV_TARGET_HOSTS }}" >> ansible/inventory
+          fi
+
+      - name: Run Ansible Playbook to Deploy
+        env:
+          FRONTEND_IMAGE: ${{ needs.build-and-push.outputs.frontend_image }}
+          BACKEND_IMAGE: ${{ needs.build-and-push.outputs.backend_image }}
+        run: |
+          ansible-playbook -i ansible/inventory ansible/deploy.yml \
+            --extra-vars "environment=${ENVIRONMENT} frontend_image=${FRONTEND_IMAGE} backend_image=${BACKEND_IMAGE}" \
+            --private-key <(echo "$ANSIBLE_PRIVATE_KEY") \
+            -u ${ANSIBLE_USER} --ssh-extra-args='-o StrictHostKeyChecking=no -o ProxyCommand="ssh -W %h:%p -q ${ANSIBLE_USER}@${BASTION_HOST}"'
